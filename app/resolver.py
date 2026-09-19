@@ -20,6 +20,11 @@
 * 枚举按分支定界剪枝：已选包中已与 current_lock 不同的数量是最终成本的
   下界（选择集沿分支只增不减），下界不优于当前最优即剪枝；
 * 普通 /resolve 路径不进入优化模式，行为与性能特征完全不变。
+
+反事实模式（POST /explain-version 使用，见 resolve_forced()）：
+* 以与根需求并列的根级 ``==版本`` 约束钉住目标包后整体求解，其余规则
+  （MRV、高版本优先、回溯、预发布跟随语义、尝试上限）与普通 /resolve
+  完全一致；不进入升级优化模式，返回确定性顺序下的首个解。
 """
 
 from __future__ import annotations
@@ -345,6 +350,38 @@ class Resolver:
             self._opt_target = None
             self._best_state = None
             self._best_cost = float("inf")
+
+    # ------------------------------------------------------------------ #
+    # 反事实求解（POST /explain-version）
+    # ------------------------------------------------------------------ #
+    def resolve_forced(
+        self,
+        root_name: str,
+        root_spec: SpecifierSet,
+        root_raw: str,
+        *,
+        target: str,
+        target_version: Version,
+    ) -> State | None:
+        """把 target 钉在指定版本做反事实整体求解。
+
+        以与根需求并列的根级 ``==版本`` 约束钉住目标包（与升级模式的钉版本
+        机制相同），除此之外的一切规则——MRV、高版本优先、回溯、预发布
+        跟随语义（显式 ``==预发布`` 约束仍接受该预发布）、尝试上限——与
+        普通 /resolve 完全一致；不进入优化模式，返回确定性顺序下的首个解。
+        无解返回 None，超上限抛 ResolutionLimit。
+        """
+        target = canonical(target)
+        pin = Requirement(
+            target,
+            SpecifierSet(f"=={target_version}"),
+            f"=={target_version}",
+            None,
+            0,
+        )
+        return self.resolve(
+            root_name, root_spec, root_raw, extra_requirements=[pin]
+        )
 
     # ------------------------------------------------------------------ #
     # 升级成本（非目标包相对 current_lock 的变化数）

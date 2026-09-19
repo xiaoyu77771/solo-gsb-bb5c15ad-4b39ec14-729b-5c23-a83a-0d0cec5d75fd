@@ -240,6 +240,21 @@ def parse_root_specifier(raw: str) -> SpecifierSet:
     return _parse_specifier(raw, owner="<root request>")
 
 
+def parse_target_version(raw: str, *, label: str = "target_version") -> Version:
+    """校验请求中强制使用的单个目标版本（PEP 440）。
+
+    非法版本抛 SnapshotError（API 层映射为 422）；返回规范化后的
+    Version，使钉版本约束文本与输入拼写（空白、前导零等）无关。
+    """
+    text = str(raw).strip()
+    try:
+        return Version(text)
+    except InvalidVersion as exc:
+        raise SnapshotError(
+            f"{label} {raw!r} 不是合法的 PEP 440 版本"
+        ) from exc
+
+
 def version_satisfies(
     version: Version, spec: SpecifierSet, *, allow_prereleases: bool = False
 ) -> bool:

@@ -30,6 +30,11 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 均有效时**只比较根可达包**，按规范化包名输出 `added` / `removed` /
 `upgraded` / `downgraded`（版本方向按 PEP 440 判断），每个变化项同时
 给出其在前后依赖图中的**全部最短根路径**（不存在的一侧为空数组）。
+`/explain-version` 做**反事实版本解释**：沿用 `/resolve` 的仓库、根约束
+与目标环境，先按原规则求出**基准锁**（目标包不可达返回 422），再把
+`target_package` 强制钉在 `target_version` 上整体重解——可行时返回新锁
+及相对基准锁的 `added` / `removed` / `changed`，不可行时返回 **409**
+并复用约束来源链说明阻塞原因。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -65,6 +70,7 @@ docker compose up --build
 | SBOM 导出接口 | `POST http://localhost:8000/sbom` |
 | 许可证策略接口 | `POST http://localhost:8000/license-policy` |
 | 锁差异比较接口 | `POST http://localhost:8000/lock-diff` |
+| 版本解释接口 | `POST http://localhost:8000/explain-version` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -1130,6 +1136,141 @@ curl -s -X POST http://localhost:8000/lock-diff \
 | `409` | `before_lock` / `after_lock` 任一未通过审计：`status: "invalid_lock"`，`before` / `after` 分别携带与 `/audit-lock` 一致的确定性排序问题，不执行比较 |
 | `422` | 请求/快照非法（同 `/resolve`），或 `before_lock` / `after_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本 |
 
+### `POST /explain-version`
+
+**反事实版本解释**：把某个包强制钉在指定版本上，回答“锁会变成什么样、
+为什么办不到”。请求体包含 `/resolve` 的全部字段（`repository` / `root` /
+`target_environment` / `specifier` / `allow_prereleases`，语义完全一致），
+并附加两个字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `target_package` | `string` | 是 | 要解释的目标包名（PEP 503 规范化匹配）；**必须出现在基准锁定清单中**（从根包可达），否则返回 422 |
+| `target_version` | `string` | 是 | 强制目标包使用的 PEP 440 版本；非法版本返回 422，响应中回显规范化形式 |
+
+处理流程：
+
+1. **基准锁**：按 `/resolve` 原规则对请求求解（同一快照、同一目标环境、
+   同一根约束与 marker/预发布语义）。基准本身无解时直接返回该次求解的
+   **409** 冲突结果（与单独调用 `/resolve` 一致），不做任何反事实求解；
+2. **可达性检查**：`target_package` 不在基准锁定清单中（即从根包不可达）
+   时返回 **422**；
+3. **反事实求解**：其余规则不变，仅以一条与根需求并列的根级
+   `==target_version` 约束钉住目标包后整体重解（MRV、高版本优先、回溯、
+   预发布跟随语义、尝试上限均与 `/resolve` 相同；显式 `==预发布` 钉版本
+   时该预发布仍被接受）。**不可行时返回 409**，复用约束来源链说明阻塞
+   原因——钉版本约束本身也作为一条根级来源链出现；
+4. **可行时返回 200**：反事实锁定清单，以及相对基准锁的三类差异
+   （均按规范化包名排序）：
+
+   | 分类 | 判定 |
+   | --- | --- |
+   | `added` | 仅在反事实锁中出现的包（`version` 为新锁版本） |
+   | `removed` | 仅在基准锁中出现的包（`version` 为基准版本） |
+   | `changed` | 两侧都锁定但版本不同的包（`from` 基准版本 → `to` 新版本，含目标包本身） |
+
+   PEP 440 等价版本（`1.0` 与 `1.0.0`）不产生 `changed` 项；强制版本与
+   基准锁一致时三类差异均为 `[]`。
+
+```bash
+curl -s -X POST http://localhost:8000/explain-version \
+  -H 'Content-Type: application/json' \
+  -d @examples/explain-version.json
+```
+
+示例沿用 `/lock-diff` 示例的快照：基准锁中 `web-framework` 为 `3.2.0`
+（拉入 `telemetry-lib`，`shared-util` 锁在 `2.0.0`）。强制
+`web-framework==2.4.0` 后它改拉 `legacy-helper` 而不再依赖
+`telemetry-lib`，`shared-util` 随之回落到 `1.5.0`：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "root_version": "1.0.0",
+  "target_package": "web-framework",
+  "target_version": "2.4.0",
+  "baseline_locked": {
+    "app": "1.0.0",
+    "auth-lib": "1.1.0",
+    "json-tool": "1.0.0",
+    "shared-util": "2.0.0",
+    "telemetry-lib": "1.0.0",
+    "web-framework": "3.2.0"
+  },
+  "locked": {
+    "app": "1.0.0",
+    "auth-lib": "1.1.0",
+    "json-tool": "1.0.0",
+    "legacy-helper": "0.5.0",
+    "shared-util": "1.5.0",
+    "web-framework": "2.4.0"
+  },
+  "added": [
+    {"name": "legacy-helper", "version": "0.5.0"}
+  ],
+  "removed": [
+    {"name": "telemetry-lib", "version": "1.0.0"}
+  ],
+  "changed": [
+    {"name": "shared-util", "from": "2.0.0", "to": "1.5.0"},
+    {"name": "web-framework", "from": "3.2.0", "to": "2.4.0"}
+  ]
+}
+```
+
+- `baseline_locked`：按 `/resolve` 原规则求出的基准锁定清单（差异比较的基准）。
+- `locked`：强制目标版本后的**完整**反事实锁定清单（按规范化包名排序）。
+- `added` / `removed` / `changed`：相对基准锁的差异，各自**按包名排序**；
+  目标版本高于或低于基准均可（与 `/upgrade` 不同，不做方向限制，也不做
+  变更最小化——返回的是确定性求解顺序下的首个可行解）。
+
+反事实无解时返回 **409**，`conflicts` 与 `/resolve` 的 409 完全同形：
+钉版本约束以根级来源链（`package: null`、`requires: "==版本"`）出现，
+阻塞它的传递约束各附完整来源链：
+
+```bash
+curl -s -X POST http://localhost:8000/explain-version \
+  -H 'Content-Type: application/json' \
+  -d @examples/explain-version-conflict.json
+```
+
+示例沿用 `/resolve` 成功示例的快照：强制 `shared-util==2.0.0` 与
+`auth-lib 0.9.0` 的 `<2.0` 约束冲突（`auth-lib` 别无候选），整体无解：
+
+```json
+{
+  "status": "conflict",
+  "message": "无法将目标包 'shared-util' 强制为 2.0.0：该版本下依赖约束无解",
+  "conflicts": [
+    {
+      "subject": "shared-util",
+      "kind": "no_candidates",
+      "message": "包 shared-util 在约束交集 <2.0,==2.0.0 下没有可满足的版本；快照中的版本（降序）：2.0.0, 1.5.0, 1.4.0",
+      "constraints": [
+        {"chain": [
+          {"package": null, "version": null, "requires": "*"},
+          {"package": "app", "version": "1.0.0", "requires": "*"},
+          {"package": "auth-lib", "version": "0.9.0", "requires": "<2.0"}
+        ]},
+        {"chain": [
+          {"package": null, "version": null, "requires": "==2.0.0"}
+        ]}
+      ],
+      "partial_selection": {"app": "1.0.0", "auth-lib": "0.9.0"}
+    }
+  ]
+}
+```
+
+`/explain-version` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 反事实求解可行，返回基准锁、新锁与 added/removed/changed |
+| `409` | 基准锁无解（与 `/resolve` 的 409 一致）；或强制目标版本后无解（`status: "conflict"`，附约束来源链）；或搜索超过内置尝试上限（`status: "limit"`） |
+| `422` | 请求/快照非法（同 `/resolve`），或 `target_version` 不是合法 PEP 440 版本，或 `target_package` 不在基准锁定清单中（从根包不可达） |
+
 ---
 
 ## 三、解析规则说明
@@ -1195,6 +1336,15 @@ curl -s -X POST http://localhost:8000/lock-diff \
     不产生变化项）；每个变化项分别复用第 11 条的最短路径算法给出其在
     前后图中的全部最短根路径，不存在的一侧为空数组；四类列表各按包名
     排序、路径按字典序排序，交换提交位置结果对称，与输入顺序无关。
+16. **反事实版本解释（`/explain-version`）**：先按第 2～8 条的原规则求出
+    基准锁定清单（基准无解即返回该次求解的 409）；目标包不在基准锁中
+    （从根包不可达）返回 422。随后其余规则不变，仅以一条与根需求并列的
+    根级 `==target_version` 约束钉住目标包整体重解（显式钉预发布时该
+    预发布仍被接受，其余预发布语义不变）：可行时返回新锁与相对基准锁的
+    added / removed / changed（PEP 440 等价版本不产生 changed 项，三个
+    列表均按包名排序）；不可行时返回 409，复用第 2～8 条的约束来源链
+    说明阻塞原因，钉版本约束本身作为一条根级来源链出现。两次求解各自
+    使用独立的求解器实例，互不影响冲突收集与尝试计数。
 
 ### 安全护栏
 
@@ -1217,7 +1367,7 @@ app/
   repository.py     # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
   markers.py        # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py        # 请求/响应模型
-examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff 示例）
+examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff、/explain-version 示例）
 tests/               # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

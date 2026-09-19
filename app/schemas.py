@@ -306,6 +306,35 @@ class LockDiffRequest(_ResolveInputs):
     )
 
 
+class ExplainVersionRequest(ResolveRequest):
+    """POST /explain-version 的请求体：在 /resolve 全部字段上指定反事实目标。
+
+    先按 /resolve 原规则求出基准锁定清单（目标包必须出现在其中，否则
+    返回 422），再把 target_package 钉在 target_version 上做反事实整体
+    求解：可行返回新锁与相对基准锁的差异，无解返回 409 约束来源链。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    target_package: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description=(
+            "要解释的目标包名（PEP 503 规范化匹配）；"
+            "必须出现在基准锁定清单中（从根包可达），否则返回 422。"
+        ),
+    )
+    target_version: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "强制目标包使用的 PEP 440 版本（输出为规范化形式）；"
+            "非法版本返回 422，该版本下整体无解返回 409。"
+        ),
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -839,4 +868,77 @@ class LockDiffInvalidResponse(BaseModel):
     )
     after: LockDiffInvalidLockOut = Field(
         ..., description="after_lock 的独立审计结果（valid/issues）。"
+    )
+
+
+# --------------------------------------------------------------------- #
+# POST /explain-version 响应
+# --------------------------------------------------------------------- #
+class ExplainVersionAddedOut(BaseModel):
+    """仅在反事实锁定清单中出现的包。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="PEP 503 规范化包名。")
+    version: str = Field(..., description="反事实锁中该包的版本（PEP 440 字符串）。")
+
+
+class ExplainVersionRemovedOut(BaseModel):
+    """仅在基准锁定清单中出现的包。"""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(..., description="PEP 503 规范化包名。")
+    version: str = Field(..., description="基准锁中该包的版本（PEP 440 字符串）。")
+
+
+class ExplainVersionChangedOut(BaseModel):
+    """两侧都锁定、但版本不同的包。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    name: str = Field(..., description="PEP 503 规范化包名。")
+    from_: str = Field(
+        ..., alias="from", description="基准锁中的版本（PEP 440 字符串）。"
+    )
+    to: str = Field(..., description="反事实锁中的版本（PEP 440 字符串）。")
+
+
+class ExplainVersionResponse(BaseModel):
+    """反事实求解可行时的解释结果。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    status: Literal["ok"]
+    root: str = Field(..., description="规范化根包名。")
+    root_version: str = Field(..., description="反事实锁中根包的版本。")
+    target_package: str = Field(..., description="规范化后的目标包名。")
+    target_version: str = Field(
+        ..., description="强制使用的目标版本（PEP 440 规范化形式）。"
+    )
+    baseline_locked: dict[str, str] = Field(
+        ...,
+        description=(
+            "按 /resolve 原规则求出的基准锁定清单（规范化包名 -> 版本），"
+            "作为差异比较的基准。"
+        ),
+    )
+    locked: dict[str, str] = Field(
+        ...,
+        description="强制目标版本后的反事实锁定清单（规范化包名 -> 版本）。",
+    )
+    added: list[ExplainVersionAddedOut] = Field(
+        ...,
+        description="仅在反事实锁中出现的包，按规范化包名排序；无时为 []。",
+    )
+    removed: list[ExplainVersionRemovedOut] = Field(
+        ...,
+        description="仅在基准锁中出现的包，按规范化包名排序；无时为 []。",
+    )
+    changed: list[ExplainVersionChangedOut] = Field(
+        ...,
+        description=(
+            "两侧都锁定但版本不同的包（含目标包本身），按规范化包名排序；"
+            "PEP 440 等价版本（1.0 与 1.0.0）不产生变化项。"
+        ),
     )
