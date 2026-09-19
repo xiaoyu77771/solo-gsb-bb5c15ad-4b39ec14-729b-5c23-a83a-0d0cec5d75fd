@@ -10,6 +10,12 @@
 * POST /upgrade     在 /resolve 语义基础上附加 current_lock 与单个升级目标：
   仅考虑严格高于当前版本的候选，取能完成整体解析的最高版本，并在该版本
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
+* POST /explain-version
+  请求沿用 /resolve 的仓库、根约束与目标环境，并指定 target_package 与
+  target_version：先按 /resolve 原规则求出基准锁（目标包不可达返回 422），
+  再附加根级 ==target_version 钉约束、其余规则不变地做反事实求解；
+  可行时返回新锁及相对基准锁的 added/removed/changed，不可行时返回 409
+  并复用 /resolve 的约束来源链说明阻塞原因
 * POST /audit-lock  只审计不求解：按 current_lock 的锁定版本从根包遍历
   已激活依赖，报告 missing/unavailable/constraint_mismatch/extraneous
 * POST /dependency-paths
@@ -40,7 +46,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from .audit import audit_lock
 from .license_policy import evaluate_license_policy
@@ -60,6 +66,8 @@ from .schemas import (
     AuditLockResponse,
     DependencyPathsRequest,
     DependencyPathsResponse,
+    ExplainVersionRequest,
+    ExplainVersionResponse,
     InvalidLockResponse,
     InvalidSnapshotResponse,
     LicensePolicyRequest,
@@ -87,7 +95,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -429,6 +437,162 @@ def upgrade(request: UpgradeRequest):
         "root_version": str(state.selection[root_canonical]),
         "locked": locked,
         "changes": _lock_changes(current_lock, locked),
+    }
+
+
+def _lock_summary(state, root_canonical: str) -> dict:
+    """从求解终态提取 explain-version 使用的锁摘要（root_version + locked）。"""
+    return {
+        "root_version": str(state.selection[root_canonical]),
+        "locked": {
+            pkg: str(ver) for pkg, ver in sorted(state.selection.items())
+        },
+    }
+
+
+def _split_lock_changes(
+    baseline: dict[str, Version], counterfactual: dict[str, str]
+) -> dict:
+    """复用 /upgrade 的逐项差异（PEP 440 比较），按 added/removed/changed 分组。"""
+    added: list[dict] = []
+    removed: list[dict] = []
+    changed: list[dict] = []
+    for entry in _lock_changes(baseline, counterfactual):
+        if entry["from"] is None:
+            added.append(entry)
+        elif entry["to"] is None:
+            removed.append(entry)
+        else:
+            changed.append(entry)
+    return {"added": added, "removed": removed, "changed": changed}
+
+
+@app.post(
+    "/explain-version",
+    summary="强制目标包为指定版本的反事实求解：新锁与相对基准锁的差异",
+    response_model=ExplainVersionResponse,
+    responses={
+        409: {
+            "model": UnresolvedResponse,
+            "description": "强制版本下反事实约束无解或超过搜索上限（冲突来源链与 /resolve 同形）",
+        },
+        422: {"model": InvalidSnapshotResponse, "description": "快照或请求非法（含目标包在基准锁中不可达、目标版本非 PEP 440）"},
+    },
+)
+def explain_version(request: ExplainVersionRequest):
+    root_canonical = canonical(request.root)
+    target_canonical = canonical(request.target_package)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        target_version = Version(request.target_version.strip())
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+    except InvalidVersion:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": (
+                    f"target_version {request.target_version!r} 不是合法的 PEP 440 版本"
+                ),
+            },
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    # 第一步：按 /resolve 的既有规则求基准锁（全新 Resolver，与后续反事实
+    # 求解互不污染冲突收集）。基准本身无解时，目标包在“基准锁中”同样不可达，
+    # 按 422 处理（反事实无从比较），消息中说明基准无可行解。
+    baseline_resolver = Resolver(
+        repo, allow_prereleases=request.allow_prereleases
+    )
+    try:
+        baseline_state = baseline_resolver.resolve(
+            root_canonical, root_spec, request.specifier
+        )
+    except ResolutionLimit:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": (
+                    "基准解析超过搜索上限，无法确定基准锁，"
+                    f"目标包 {target_canonical!r} 在基准锁中的可达性未知"
+                ),
+            },
+        )
+
+    if baseline_state is None:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": (
+                    f"基准解析无可行解，目标包 {target_canonical!r} 在基准锁中不可达"
+                ),
+            },
+        )
+
+    baseline_lock = dict(baseline_state.selection)
+    if target_canonical not in baseline_lock:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": (
+                    f"目标包 {target_canonical!r} 在基准锁中不可达，"
+                    "无法对其做反事实版本求解"
+                ),
+            },
+        )
+
+    # 第二步：除根级 ==target_version 钉约束外，其余规则（marker 激活、
+    # MRV/回溯、候选排序、预发布跟随语义）与 /resolve 完全一致。
+    resolver = Resolver(repo, allow_prereleases=request.allow_prereleases)
+    try:
+        state = resolver.force_version(
+            root_canonical,
+            root_spec,
+            request.specifier,
+            target=target_canonical,
+            target_version=target_version,
+        )
+    except ResolutionLimit:
+        return JSONResponse(
+            status_code=409,
+            content=_conflict_payload(resolver.build_conflicts(limit=True)),
+        )
+
+    if state is None:
+        content = _conflict_payload(resolver.build_conflicts())
+        content["message"] = (
+            f"强制 {target_canonical}=={target_version} 的反事实求解不可行："
+            "该钉约束与仓库快照、根约束或传递依赖冲突（见冲突来源链）"
+        )
+        return JSONResponse(status_code=409, content=content)
+
+    locked = {pkg: str(ver) for pkg, ver in sorted(state.selection.items())}
+    return {
+        "status": "ok",
+        "root": root_canonical,
+        "target_package": target_canonical,
+        "target_version": str(target_version),
+        "baseline": _lock_summary(baseline_state, root_canonical),
+        "counterfactual": _lock_summary(state, root_canonical),
+        "diff": _split_lock_changes(baseline_lock, locked),
     }
 
 

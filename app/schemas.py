@@ -201,6 +201,37 @@ class UpgradeRequest(ResolveRequest):
     )
 
 
+class ExplainVersionRequest(ResolveRequest):
+    """POST /explain-version 的请求体：在 /resolve 全部字段上附加反事实目标。
+
+    先按 /resolve 原规则求出基准锁；目标包在基准锁中不可达时返回 422。
+    随后附加一条根级 ``==target_version`` 钉约束，按其余完全不变的规则
+    做反事实求解：可行时返回新锁及相对基准锁的 added/removed/changed；
+    不可行时返回 409 并复用 /resolve 的冲突来源链。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    target_package: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description=(
+            "反事实目标包名（PEP 503 规范化匹配）；必须在基准锁中可达，"
+            "否则返回 422。"
+        ),
+    )
+    target_version: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "强制目标包使用的 PEP 440 版本；按 PEP 440 规范化匹配候选"
+            "（如 1.0 等价于 1.0.0）。非法版本返回 422；快照中无此版本"
+            "或该钉约束与其他规则冲突导致整体无解时返回 409。"
+        ),
+    )
+
+
 class AuditLockRequest(ResolveRequest):
     """POST /audit-lock 的请求体：在 /resolve 全部字段上附加被审计的锁定清单。
 
@@ -358,6 +389,70 @@ class UpgradeResponse(BaseModel):
             "相对 current_lock 的全部变化（含目标包），按包名排序；"
             "from 为 null 表示新增，to 为 null 表示删除。"
         ),
+    )
+
+
+class ExplainVersionLockOut(BaseModel):
+    """explain-version 中一份锁的摘要：根版本与按包名排序的锁定清单。"""
+
+    model_config = {"extra": "forbid"}
+
+    root_version: str = Field(..., description="该锁锁定的根包版本。")
+    locked: dict[str, str] = Field(
+        ..., description="确定性锁定清单：规范化包名 -> 版本。"
+    )
+
+
+class ExplainVersionDiffOut(BaseModel):
+    """反事实锁相对基准锁的差异。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    added: list[ChangeOut] = Field(
+        ...,
+        description=(
+            "仅出现在反事实锁中的包，按包名排序；每项 from 为 null。"
+        ),
+    )
+    removed: list[ChangeOut] = Field(
+        ...,
+        description=(
+            "仅出现在基准锁中的包，按包名排序；每项 to 为 null。"
+        ),
+    )
+    changed: list[ChangeOut] = Field(
+        ...,
+        description=(
+            "两份锁中均存在但版本不同的包（含目标包自身），按包名排序；"
+            "版本按 PEP 440 比较（1.0 与 1.0.0 等价，不产生变化项）。"
+        ),
+    )
+
+
+class ExplainVersionResponse(BaseModel):
+    """POST /explain-version 成功响应：基准锁摘要、反事实锁与二者差异。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    status: Literal["ok"]
+    root: str
+    target_package: str = Field(..., description="规范化（PEP 503）后的目标包名。")
+    target_version: str = Field(
+        ...,
+        description="请求强制的目标版本（PEP 440 规范化后的字符串）。",
+    )
+    baseline: ExplainVersionLockOut = Field(
+        ...,
+        description=(
+            "按 /resolve 原规则（不含钉约束）求出的基准锁摘要。"
+        ),
+    )
+    counterfactual: ExplainVersionLockOut = Field(
+        ...,
+        description="强制 target_package==target_version 后求出的新锁摘要。",
+    )
+    diff: ExplainVersionDiffOut = Field(
+        ..., description="反事实锁相对基准锁的 added/removed/changed。"
     )
 
 

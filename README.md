@@ -6,6 +6,11 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 搜索生成**确定性锁定清单**；无解时返回从根需求到冲突包的**约束来源链**。
 `/upgrade` 在现有锁定清单（`current_lock`）上升级单个目标包：取能完成
 整体解析的最高版本，并最小化其余包相对当前锁的变更数量。
+`/explain-version` 回答“**如果强制把某个包锁到指定版本会怎样**”：请求沿用
+`/resolve` 的仓库、根约束与目标环境，先按原规则求出**基准锁**（目标包在
+基准锁中不可达返回 422），再在其余规则不变的前提下附加根级 `==版本` 钉
+约束做**反事实求解**——可行时返回新锁及相对基准锁的 `added` / `removed`
+/ `changed`，不可行时返回 409 并复用约束来源链说明阻塞原因。
 `/resolve-matrix` 把**同一份快照与根约束**提交给 **2～8 个带唯一 `id` 的
 目标环境**：逐环境复用 `/resolve` 的全部规则求解，返回按 `id` 排序的各环境
 锁定清单，以及按包名排序的跨环境版本矩阵（每个包记录各环境版本——未出现为
@@ -41,6 +46,10 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 - **最小变更升级**：`/upgrade` 只考虑严格高于当前版本的目标候选，取能完成
   整体解析的最高版本；该版本下在所有有效解中优先选择非目标包相对
   `current_lock` 新增/删除/版本变化数量最少的解。
+- **反事实版本解释**：`/explain-version` 先求基准锁，再只附加一条根级
+  `==target_version` 钉约束、其余规则完全不变地求解；可行时给出新锁与
+  `added` / `removed` / `changed`，不可行时冲突来源链直接指出被哪条根/
+  传递约束阻塞。
 - **环安全**：依赖环（含自环、菱形依赖）不会导致重复展开；环上的新约束仍会校验。
 - **确定性**：结果只取决于快照内容与目标环境，与包键顺序、候选列表顺序无关。
 
@@ -60,6 +69,7 @@ docker compose up --build
 | 解析接口 | `POST http://localhost:8000/resolve` |
 | 跨环境矩阵接口 | `POST http://localhost:8000/resolve-matrix` |
 | 升级接口 | `POST http://localhost:8000/upgrade` |
+| 反事实版本解释接口 | `POST http://localhost:8000/explain-version` |
 | 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 依赖路径接口 | `POST http://localhost:8000/dependency-paths` |
 | SBOM 导出接口 | `POST http://localhost:8000/sbom` |
@@ -522,6 +532,162 @@ curl -s -X POST http://localhost:8000/upgrade \
 | `200` | 升级成功，返回完整 `locked` 与 `changes` |
 | `409` | 无可行升级（没有严格更高的候选，或所有更高候选都无法完成整体解析，`status: "conflict"` 并附冲突来源链）；或搜索超过内置尝试上限（`status: "limit"`） |
 | `422` | 请求/快照非法（同 `/resolve`），或 `target` 不存在于 `current_lock` 中、`current_lock` 含非法 PEP 440 版本 |
+
+### `POST /explain-version`
+
+回答一个**反事实**问题：在**同一份仓库快照、根约束与目标环境**下，如果
+强制把某个包锁到指定版本，最终锁定清单会变成什么？请求体沿用 `/resolve`
+的全部字段（`repository` / `root` / `target_environment` / `specifier` /
+`allow_prereleases`，语义完全一致），并附加两个字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `target_package` | `string` | 是 | 反事实目标包名（PEP 503 规范化匹配）；必须在**基准锁**中根可达，否则返回 422 |
+| `target_version` | `string` | 是 | 强制目标包使用的 **PEP 440 版本**；非法版本返回 422。版本按 PEP 440 规范化匹配候选（`1.0` 等价于 `1.0.0`），响应中的 `target_version` 为规范化后的字符串 |
+
+处理流程：
+
+1. **求基准锁**：完全按 `/resolve` 的既有规则（marker 激活、MRV/回溯、
+   候选降序、预发布跟随语义、尝试上限）对请求求一次解，得到基准锁。
+   - 基准锁本身无可行解、或超过搜索上限时返回 **422**（无法定义“基准锁
+     中的可达性”，反事实无从比较）；
+   - `target_package` 不在基准锁中（即从根包不可达）时返回 **422**，
+     即使该包存在于快照的其他分支中；
+2. **反事实求解**：在基准请求之外附加**一条**根级 `==target_version`
+   钉约束，**其余规则一律不变**地再求一次解（与 `/upgrade` 不同，这里
+   **不做**相对基准锁的变更最小化——无约束的包仍按高版本优先的既定
+   确定性顺序选择，返回遇到的首个完整解）。钉约束与根需求同级，会出现在
+   409 的约束来源链首跳；
+3. 反事实可行时返回 **200**：基准锁摘要、反事实锁摘要，以及后者相对前者
+   的三类差异；不可行（`target_version` 不在快照、与根约束或任一传递
+   约束冲突、或超过搜索上限）时返回 **409**，冲突结构与 `/resolve` 的
+   409 逐字段一致。
+
+三类差异（`diff`，均**按规范化包名排序**，版本按 PEP 440 比较；
+`1.0` 与 `1.0.0` 等价，不产生变化项）：
+
+| 分类 | 判定 | 条目形态 |
+| --- | --- | --- |
+| `added` | 仅出现在反事实锁中的包 | `{"name", "from": null, "to"}` |
+| `removed` | 仅出现在基准锁中的包 | `{"name", "from", "to": null}` |
+| `changed` | 两份锁中均存在但版本不同的包（**含目标包自身**） | `{"name", "from", "to"}` |
+
+强制版本恰好就是基准锁版本（或与之 PEP 440 等价）时，三个列表均为空。
+
+```bash
+curl -s -X POST http://localhost:8000/explain-version \
+  -H 'Content-Type: application/json' \
+  -d @examples/explain-version.json
+```
+
+示例中基准锁取 `web-framework 3.2.0`（经 `telemetry-lib` 与
+`auth-lib`）；强制 `web-framework==2.4.0` 后改拉 `legacy-helper`、
+不再需要 `telemetry-lib`，三类差异各有体现：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "target_package": "web-framework",
+  "target_version": "2.4.0",
+  "baseline": {
+    "root_version": "1.0.0",
+    "locked": {
+      "app": "1.0.0",
+      "auth-lib": "0.9.0",
+      "shared-util": "1.5.0",
+      "telemetry-lib": "1.0.0",
+      "web-framework": "3.2.0"
+    }
+  },
+  "counterfactual": {
+    "root_version": "1.0.0",
+    "locked": {
+      "app": "1.0.0",
+      "auth-lib": "0.9.0",
+      "legacy-helper": "0.5.0",
+      "shared-util": "1.5.0",
+      "web-framework": "2.4.0"
+    }
+  },
+  "diff": {
+    "added": [
+      {"name": "legacy-helper", "from": null, "to": "0.5.0"}
+    ],
+    "removed": [
+      {"name": "telemetry-lib", "from": "1.0.0", "to": null}
+    ],
+    "changed": [
+      {"name": "web-framework", "from": "3.2.0", "to": "2.4.0"}
+    ]
+  }
+}
+```
+
+强制版本被其他约束阻塞时返回 **409**，`conflicts` 与 `/resolve` 同形：
+每条来源链都从根需求开始，其中钉约束显示为根需求一跳
+（`package: null, requires: "==3.1.0"`），可直接读出是“哪条路径上的哪条
+约束”与强制版本冲突：
+
+```bash
+curl -s -X POST http://localhost:8000/explain-version \
+  -H 'Content-Type: application/json' \
+  -d @examples/explain-version-conflict.json
+```
+
+上例中 `web-framework 3.1.0` 要求 `shared-util==2.0.0`，而 `auth-lib`
+要求 `<2.0`：
+
+```json
+{
+  "status": "conflict",
+  "message": "强制 web-framework==3.1.0 的反事实求解不可行：该钉约束与仓库快照、根约束或传递依赖冲突（见冲突来源链）",
+  "conflicts": [
+    {
+      "subject": "shared-util",
+      "kind": "no_candidates",
+      "message": "包 shared-util 在约束交集 <2.0,==2.0.0 下没有可满足的版本；快照中的版本（降序）：2.0.0, 1.5.0, 1.4.0",
+      "constraints": [
+        {"chain": [
+          {"package": null, "version": null, "requires": "*"},
+          {"package": "app", "version": "1.0.0", "requires": "*"},
+          {"package": "auth-lib", "version": "0.9.0", "requires": "<2.0"}
+        ]},
+        {"chain": [
+          {"package": null, "version": null, "requires": "==3.1.0"},
+          {"package": "web-framework", "version": "3.1.0", "requires": "==2.0.0"}
+        ]}
+      ],
+      "partial_selection": {"app": "1.0.0", "auth-lib": "0.9.0", "web-framework": "3.1.0"}
+    }
+  ]
+}
+```
+
+语义细节：
+
+- **包名规范化、marker、排序语义与 `/resolve` 完全一致**：换一个
+  `target_environment`，基准锁与反事实锁都按新环境下激活的依赖重算；
+  未激活 marker 依赖既不参与基准求解，也不阻塞强制版本。
+- **预发布**遵循同一套 pip 跟随语义：默认排除预发布候选，但约束谓词
+  显式钉住预发布（`target_version: "2.0rc1"`）时该钉约束可满足；
+  `allow_prereleases` 同样只影响除目标钉以外的其他包。
+- `target_version` 版本串合法但快照中无此候选时是 **409**（钉约束无候选，
+  来源链中 `kind` 为 `no_candidates`）；版本串本身不是合法 PEP 440 时才是
+  **422**。
+- 目标包可以是根包自身：此时强制版本还必须满足根 `specifier`，否则
+  同样返回 409。
+- 输出只取决于快照、根约束、目标环境、目标包与目标版本：重复请求逐字节
+  一致，且不影响随后调用 `/resolve` 的结果（两次求解使用相互独立的
+  求解器状态）。
+
+`/explain-version` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 反事实求解成功，返回 `baseline` / `counterfactual` 两份锁摘要与 `diff`（三个列表全为空表示两锁等价） |
+| `409` | 基准锁之后的反事实求解无解（`target_version` 不在快照、与根/传递约束冲突，`status: "conflict"` 并附与 `/resolve` 同形的约束来源链）；或反事实搜索超过内置尝试上限（`status: "limit"`） |
+| `422` | 请求/快照非法（同 `/resolve`），或 `target_version` 不是合法 PEP 440、基准锁本身无可行解/超过上限、`target_package` 在基准锁中不可达 |
 
 ### `POST /audit-lock`
 
@@ -1154,45 +1320,55 @@ curl -s -X POST http://localhost:8000/lock-diff \
    解析的版本；随后在该版本的所有有效解中枚举并保留“非目标包相对
    `current_lock` 变化数量最少”的解（分支定界剪枝，变化数相同按既定
    确定性顺序取先遇到者）。`/resolve` 的行为不受任何影响。
-10. **审计（`/audit-lock`）**：不求解，只按 `current_lock` 的锁定版本从根包
+10. **反事实版本（`/explain-version`）**：沿用 `/resolve` 的仓库、根约束
+    与目标环境，先按第 2～8 条原规则求出基准锁；基准锁无解/超过上限或
+    `target_package` 在基准锁中不可达时返回 422。随后**只**附加一条根级
+    `==target_version` 钉约束（与根需求同级、进入冲突来源链），其余规则
+    完全不变地再做一次普通求解（不做变更最小化，取既定确定性顺序的首个
+    完整解）：可行时返回基准锁与新锁摘要及 `added` / `removed` /
+    `changed`（按包名排序、PEP 440 版本比较，等价版本不产生变化项，
+    强制版本即基准版本时三列表全空）；不可行或超过上限返回 409，冲突
+    结构与 `/resolve` 同形。包名规范化、marker 激活、预发布跟随与排序
+    语义与 `/resolve` 逐字一致；两次求解状态相互独立，不影响 `/resolve`。
+11. **审计（`/audit-lock`）**：不求解，只按 `current_lock` 的锁定版本从根包
     遍历已激活依赖：环中包只展开一次但累计全部入边约束；输出
     missing / unavailable / constraint_mismatch / extraneous 四类确定性
     排序的问题，包名按 PEP 503、版本与约束按 PEP 440 判断。
-11. **依赖路径（`/dependency-paths`）**：先复用第 10 条的审计，锁无效即
+12. **依赖路径（`/dependency-paths`）**：先复用第 11 条的审计，锁无效即
     返回 409 且不查询；锁有效时按锁定版本展开已激活依赖建图，BFS 返回根包
     到目标包的全部最短包路径：菱形等长路径全保留，环不重复节点、不会无限
     遍历，路径按字典序确定性排序；目标为根包返回单节点路径，不可达返回
     `reachable: false` 与空路径。
-12. **跨环境矩阵（`/resolve-matrix`）**：对同一份快照与根约束，在 2～8 个
+13. **跨环境矩阵（`/resolve-matrix`）**：对同一份快照与根约束，在 2～8 个
     带唯一 `id` 的目标环境上各跑一遍第 2～8 条的同一套求解（环境间完全
     独立、各自回溯与冲突收集）。全部成功时 `results` 按 `id` 排序给出各
     环境锁定清单，`matrix` 按包名排序逐包记录各环境版本（未出现为
     `null`）：所有环境都存在且版本一致为 `shared`，否则（版本不同或仅部分
     环境出现）为 `divergent`；任一环境无解则整体 409，`failures` 按 `id`
     排序给出各失败环境与 `/resolve` 同形的原冲突结果。
-13. **物料清单（`/sbom`）**：先复用第 10 条的审计，锁无效即返回 409 且不
-    导出；锁有效时沿第 11 条的已激活依赖图（按锁定版本、无版本选择）逐包
+14. **物料清单（`/sbom`）**：先复用第 11 条的审计，锁无效即返回 409 且不
+    导出；锁有效时沿第 12 条的已激活依赖图（按锁定版本、无版本选择）逐包
     导出规范化名称、版本、PURL（`pkg:pypi/<name>@<version>`）、已激活
     依赖名称（去重排序）与候选版本携带的 `source_url` / `sha256` /
     `license` 元数据；元数据缺失不阻断导出，只在 `warnings` 中按包名逐项
     提示；`packages` 按包名排序，输出只取决于快照、环境与锁。
-14. **许可证策略（`/license-policy`）**：先复用第 10 条的审计，锁无效即
-    返回 409 且不判定；锁有效时在第 11 条的已激活依赖图上逐包读取锁定
+15. **许可证策略（`/license-policy`）**：先复用第 11 条的审计，锁无效即
+    返回 409 且不判定；锁有效时在第 12 条的已激活依赖图上逐包读取锁定
     版本的 `metadata.license`：未提供归为未知（不阻断），提供则解析
     SPDX `AND`/`OR`/括号表达式（`OR` 低于 `AND`，括号分组；关键字大小
     写不敏感、标识大小写敏感），按 allow/deny 两个标识集合做三态求值——
     标识在 deny 中为拒绝、仅在 allow 中为允许、其余未知；`AND` 全部允许
     才通过、任一拒绝即违规；`OR` 任一允许即通过、全部拒绝才违规、其余
     未知。`violations` 与 `unknowns` 各自按包名排序，每项复用
-    第 11 条的最短路径算法附根包到该包的全部最短路径；非法 SPDX 表达式
+    第 12 条的最短路径算法附根包到该包的全部最短路径；非法 SPDX 表达式
     （含 `WITH`）、allow/deny 非法标识或两集合重叠返回 422，输出确定。
-15. **锁差异比较（`/lock-diff`）**：同一份快照与目标环境下提交
-    before_lock / after_lock，两份锁**各自独立**复用第 10 条的审计
+16. **锁差异比较（`/lock-diff`）**：同一份快照与目标环境下提交
+    before_lock / after_lock，两份锁**各自独立**复用第 11 条的审计
     （即使一份已无效仍审计另一份），任一无效即整体 409 且分别标注
-    before/after 的问题、不做比较；均有效时在两张第 11 条的已激活依赖
+    before/after 的问题、不做比较；均有效时在两张第 12 条的已激活依赖
     图上只比较**根可达包**：after 独有为 added、before 独有为 removed、
     两侧均有则按 PEP 440 版本方向分为 upgraded / downgraded（等价版本
-    不产生变化项）；每个变化项分别复用第 11 条的最短路径算法给出其在
+    不产生变化项）；每个变化项分别复用第 12 条的最短路径算法给出其在
     前后图中的全部最短根路径，不存在的一侧为空数组；四类列表各按包名
     排序、路径按字典序排序，交换提交位置结果对称，与输入顺序无关。
 
@@ -1207,7 +1383,7 @@ curl -s -X POST http://localhost:8000/lock-diff \
 ```
 app/
   main.py           # FastAPI 路由与错误映射
-  resolver.py       # 回溯求解器（候选排序 / MRV / 来源链重建）
+  resolver.py       # 回溯求解器（候选排序 / MRV / 来源链重建 / 升级优化 / 反事实钉版本）
   audit.py          # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
   paths.py          # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全）
   sbom.py           # 沿已激活依赖图导出确定性 JSON SBOM（PURL / 元数据 / 缺失 warnings）
@@ -1217,7 +1393,7 @@ app/
   repository.py     # 快照规范化、PEP 440/503 解析、按环境过滤 marker、候选元数据校验
   markers.py        # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py        # 请求/响应模型
-examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff 示例）
+examples/            # curl 示例请求体（含跨环境 marker、/resolve-matrix、/upgrade、/explain-version、/audit-lock、/dependency-paths、/sbom、/license-policy、/lock-diff 示例）
 tests/               # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml
